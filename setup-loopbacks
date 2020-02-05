@@ -1,0 +1,10 @@
+#!/usr/bin/perl
+my $from=$ARGV[0];
+my $to=$ARGV[1];
+$to=$from unless defined($to);
+for(my $i=$from;$i<=$to;$i++){
+  my $addr=$i+1;
+  system("ip link add link lo name lo.${i} type dummy");
+  system("ip address add 127.0.0.${addr}/32 dev lo.${i}");
+  }
+

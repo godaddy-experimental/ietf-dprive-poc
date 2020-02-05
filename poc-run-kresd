@@ -1,0 +1,80 @@
+#!/usr/bin/perl
+
+# poc-run-kresd
+
+# kresd (knot-resolver) doesn't properly include daemon mode options and behavior.
+#
+# This script wraps kresd so that kresd can run as an actual daemon, disassociated from a controlling parent process and terminal.
+#
+# Additionally, the pid of kresd is captured, so that kresd can be safely stopped at some subsequent time.
+#
+# This script is intended to be called by another script with extra parameters (e.g. part of testing/automation scripts)
+
+use Getopt::Std;
+use Sys::Syslog;
+our($opt_p,$opt_o); # path, old
+getopts("p:o");
+die "Need to specify path with '-p PATH'" unless defined ($opt_p);
+my $base_path=$opt_p;
+
+if($ARGV[0] eq "stop"){
+  my $running_pid = `cat ${base_path}/var/run/kresd/kresd.pid`;
+  chomp($running_pid);
+  system("kill $running_pid");
+  system("rm ${base_path}/var/run/kresd/kresd.pid");
+  exit();
+  }
+
+use POSIX "setsid";
+
+sub daemonize {
+   chdir("/")                      || die "can't chdir to /: $!";
+   open(STDIN,  "< /dev/null")     || die "can't read /dev/null: $!";
+   open(STDOUT, "> /dev/null")     || die "can't write to /dev/null: $!";
+   defined(my $pid = fork())       || die "can't fork: $!";
+   # non-zero now means I am the parent
+   if($pid){
+     # only the parent knows the PID, so save the child's PID in the right place
+     open(PID,">${base_path}/var/run/kresd/kresd.pid") || die "Can't create kresd.pid";
+     printf PID "%d\n",$pid;
+     close(PID);
+     exit;
+     }
+   (setsid() != -1)                || die "Can't start a new session: $!";
+   open(STDERR, ">&STDOUT")        || die "can't dup stdout: $!";
+}
+
+
+# first fork
+#
+# then daemonize from the child
+#
+# then in the child, exec() the program we want to run, and save the child pid in a file
+#
+# or in the parent, exit
+
+# FIXME
+defined(my $ppid = fork())       || die "can't fork: $!";
+
+if(!$ppid){
+  # set up %ENV things required by the compiled kresd (weird dependencies currently due to build/package problem(s) on centos/centos8)
+  $ENV{'LD_LIBRARY_PATH'}="/opt/local/lib64:/opt/local/lib:/usr/lib64:/usr/lib:/lib64:/lib";
+  openlog($0, "ndelay,pid", "local0");
+  syslog("info","Starting kresd in ${opt_p} with LD_LIBRARY_PATH=$ENV{'LD_LIBRARY_PATH'}");
+  closelog();
+
+  # we're the child, so daemonize
+  daemonize();
+
+  # now run kresd with proper parameters
+  my $config_file="config.new";
+  $config_file="config" if defined($opt_o);
+  exec('/opt/local/sbin/kresd','-f','1','-c',"${base_path}/etc/kres/${config_file}","${base_path}/etc/kres");
+
+  # we cannot reach this point unless exec() fails!
+  warn "Hey! Who turned out the lights?!";
+  exit();
+  }
+else {
+  exit();
+  }
