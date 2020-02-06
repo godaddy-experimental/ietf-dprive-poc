@@ -1,48 +1,29 @@
 #!/usr/bin/perl
 
-# The MIT License (MIT)
-# 
-# Copyright (c) 2020 GoDaddy Operating Company, LLC.
-# 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
 # upgrade-proxy
 
-# script to act as a proxy for PoC of the DPRIVE thing
+# script to act as a proxy for PoC of the DPRIVE upgrade-same-resolver to DoH with client-side discovery of resolver info
 #
-# First stage is to configure and/or install itself, including role and parameters and preferences
+# Perform initialization work prior to resolver/forwarder/stub start-up (learning stuff that isn't part of preferences)
 #
-# Second stage is to perform any initialization work at start-up (learning stuff that isn't part of preferences)
+# This "upgrades" the pre-existing knot-resolver configs when performed on each relevant host, to support/require DoT
 #
-# Third stage is to start proxying, and to keep an eye on relevant TTLs (and re-fire the initialization bits when appropriate)
+# Post upgrade, stub will do DoT proxying
+#
+# Future work includes: keep an eye on relevant TTLs (and re-fire the initialization bits when appropriate and restart bind and/or knot-resolver)
 
-# This should be capable of being a "resolver"-proxy, a "stub"-proxy, or a "forwarder"-proxy.
+# This is capable of producing a "resolver"-proxy, a "stub"-proxy, or a "forwarder"-proxy.
 #
-# A "stub"-proxy would listen on localhost, and do the topology stuff to identify the current best choice of resolver.
+# A "stub"-proxy listens on localhost, and do the topology stuff to identify the current best choice of resolver.
 #
 # A "resolver"-proxy would know itself and publish relevant information, and basically otherwise pass queries to the resolver it sits in front of.
-# It is assumed that the resolver behind it is traditional port-53, and that this proxy is DoT and/or DoH, plus authoritative stuff internal to itself.
+# It is assumed that the resolver behind it is traditional port-53 (and/or has this upgrade applied).
 #
-# A "forwarder"-proxy blah blah blah.
+# A "forwarder"-proxy answers on DoT/DoH plus Do53, and publishes relevant information to enable a client to upgrade to DoT/DoH
 
 # High-level plan for components:
-# use existing BIND code for resolver, forwarder, and stub, with added authoritative zones to achieve goals.
+# use existing knot-dns code for resolver, forwarder, and stub
+# use existing BIND code for related authority server component for resolver and forwarder (resolver-name.arpa and *.zz zones)
 # use open source tools (openssl) for generating self-signed certs
 # use bind tools for extracting fingerprints and creating TLSA records
 # use bind tools for generating dnskeys, signing zones, and serve signed version of zones
@@ -51,6 +32,7 @@
 # include stuff for adding TLSA certs to trust store (for DoH usage on stub)
 # also do stuff with "dig" for upstream population, plus looking at /etc/resolv.conf content
 # check bind vs unbound for DoH listener capabilities (or knot or other similar things, or even third party tools)
+# FIXME future work below this point
 # look at nginx or apache for full HTTPS proxy plus DoH interception with wild-card TLS cert on server side
 # have periodic watcher check for expiring records in cache, and re-do or update upstream portions and/or DHCP client portions
 # Look at ISC dhcpd for adding custom response codes for DNSSEC trust anchors
