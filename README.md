@@ -62,7 +62,7 @@ The other scripts here do the following things:
 setup-loopbacks
   - create sub-interfaces with expected names and addresses, requires the netmask change to be done first
 build-scenarios
-  - uses "scenarios.txt" to create a collection of scenarios
+  - uses "scenarios.txt" to create one out of a collection of scenarios
   - each scenario is a set of servers
     - these servers are assigned single loopback interfaces and addresses on which they listen
     - each server is a single stub, forwarder, or resolver
@@ -73,9 +73,13 @@ build-scenarios
     - each scenario is intended to run those servers to demonstrate how it all works within that scenario
   - each scenario has a topology relating the servers, rooted at a single "stub"
   - each scenario has rules for which servers get upgraded
-  - upgrading needs to be done in the correct order, basically right-to-left, also listed in the "scenarios.txt" file
+  - upgrading needs to be done in the correct order, basically right-to-left; this is also specified in the "scenarios.txt" file
   - each upgrade needs to be done while the other servers are running, and then the upgraded server is started.
     - doing this right-to-left avoids having to re-start servers
+  - build-scenarios will upgrade and start the servers in the correct order, for the specified scenario number.
+    - the upgrading is done via the "upgrade-proxy" script
+    - running the servers is done either by calling named (with the required parameters), or the poc-run-kresd script (with parameters)
 poc-run-kresd
   - script for "daemon"-type launch of knot-resolver daemon, handles PID stuff and reaping logic.
   - knot-resolver doesn't do this itself, while bind does do this correctly out-of-the-box.
+  - supports "start" and "stop" as well as selection of scenario/server/config-file
