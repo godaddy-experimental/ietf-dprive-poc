@@ -20,12 +20,12 @@ Long term expectation is various implementations will build the logic/functional
 (Not stuff I'll be working on directly, and lots of implementations hopefully will do this.)
 
 Requirements:
-  perl
-  (probably some perl libraries)
-  bind (recent build) and bind-tools (especially delv)
-  knot-resolver
-  gnu tls
-  openssl tools
+ - perl
+ - (probably some perl libraries)
+ - bind (recent build) and bind-tools (especially delv)
+ - knot-resolver
+ - gnu tls
+ - openssl tools
 
 NB: OS notes:
 - Packages for centos7 don't have the necessary version of gnu tls, so I used centos8 (we use centos).
@@ -36,7 +36,7 @@ NB: OS notes:
 - The logic currently bypasses any upgraded forwarder(s); this may or may not be a desired result, or could be a selectable option
 
 
-(The main part of the PoC, "upgrade-proxy", is a big perl script)
+The main part of the PoC, "upgrade-proxy", is a big perl script
 
 The upgrade-proxy script is doing stuff that involves:
 - creating self-signed TLS certs (using the openssl toolkit)
@@ -59,9 +59,9 @@ All of the other loopback subinterfaces have IP addresses assigned sequentially,
 
 The other scripts here do the following things:
 
-setup-loopbacks
+- setup-loopbacks
   - create sub-interfaces with expected names and addresses, requires the netmask change to be done first
-build-scenarios
+- build-scenarios
   - uses "scenarios.txt" to create one out of a collection of scenarios
   - each scenario is a set of servers
     - these servers are assigned single loopback interfaces and addresses on which they listen
@@ -79,7 +79,7 @@ build-scenarios
   - build-scenarios will upgrade and start the servers in the correct order, for the specified scenario number.
     - the upgrading is done via the "upgrade-proxy" script
     - running the servers is done either by calling named (with the required parameters), or the poc-run-kresd script (with parameters)
-poc-run-kresd
+- poc-run-kresd
   - script for "daemon"-type launch of knot-resolver daemon, handles PID stuff and reaping logic.
   - knot-resolver doesn't do this itself, while bind does do this correctly out-of-the-box.
   - supports "start" and "stop" as well as selection of scenario/server/config-file
