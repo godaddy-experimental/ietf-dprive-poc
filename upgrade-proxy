@@ -1,0 +1,1407 @@
+#!/usr/bin/perl
+
+# upgrade-proxy
+
+# script to act as a proxy for PoC of the DPRIVE upgrade-same-resolver to DoH with client-side discovery of resolver info
+#
+# Perform initialization work prior to resolver/forwarder/stub start-up (learning stuff that isn't part of preferences)
+#
+# This "upgrades" the pre-existing knot-resolver configs when performed on each relevant host, to support/require DoT
+#
+# Post upgrade, stub will do DoT proxying
+#
+# Future work includes: keep an eye on relevant TTLs (and re-fire the initialization bits when appropriate and restart bind and/or knot-resolver)
+
+# This is capable of producing a "resolver"-proxy, a "stub"-proxy, or a "forwarder"-proxy.
+#
+# A "stub"-proxy listens on localhost, and do the topology stuff to identify the current best choice of resolver.
+#
+# A "resolver"-proxy would know itself and publish relevant information, and basically otherwise pass queries to the resolver it sits in front of.
+# It is assumed that the resolver behind it is traditional port-53 (and/or has this upgrade applied).
+#
+# A "forwarder"-proxy answers on DoT/DoH plus Do53, and publishes relevant information to enable a client to upgrade to DoT/DoH
+
+# High-level plan for components:
+# use existing knot-dns code for resolver, forwarder, and stub
+# use existing BIND code for related authority server component for resolver and forwarder (resolver-name.arpa and *.zz zones)
+# use open source tools (openssl) for generating self-signed certs
+# use bind tools for extracting fingerprints and creating TLSA records
+# use bind tools for generating dnskeys, signing zones, and serve signed version of zones
+# initialization and update phases done with perl scripting to call above steps
+# include stuff for adding new managed-keys for upstream servers (forwarders) or resolver (stub)
+# include stuff for adding TLSA certs to trust store (for DoH usage on stub)
+# also do stuff with "dig" for upstream population, plus looking at /etc/resolv.conf content
+# check bind vs unbound for DoH listener capabilities (or knot or other similar things, or even third party tools)
+# FIXME future work below this point
+# look at nginx or apache for full HTTPS proxy plus DoH interception with wild-card TLS cert on server side
+# have periodic watcher check for expiring records in cache, and re-do or update upstream portions and/or DHCP client portions
+# Look at ISC dhcpd for adding custom response codes for DNSSEC trust anchors
+
+use strict;
+
+# Global stuff here
+my @name_alphabet=("0".."9","a".."v");
+
+# Main options processing stuff
+my $options='
+-t TYPE (stub, forwarder, resolver)
+-P phase (learn, build, run)
+-p path (base path for config stuff)
+-N (generate my name, needed unless "hostname" is the right name to use)
+-Z (generate zone, needed unless zone already exists)
+-C (generate self-signed cert, needed unless real cert exists and will be used)
+-L (add listeners for DoH, DoT)
+-A (auto, assumes flags -N -Z -C -c DEFAULT_CERT_PATH)
+-M (Mac OS - different flag for base64 command)
+-T TLS_PORT (select different port for DoT rather than default 853)
+-W WWW_PORT (select different port for DoH rather than default 443)
+-H (help)
+-V (version)
+';
+
+my $flags='-t TYPE -p path [-P phase] [-b] [-A] [-N] [-Z] [-C] [-L] [-H] [-V] [-M] [-T dot-port] [-W doh-port] ';
+
+my $version="PoC pre-alpha, don't expect anything to actually work yet...";
+
+# NB: opt_b means "broken", kresd version doesn't work right for DoH stuff... suppress those bits
+# NB: opt_d means debug, print out extra messages/diagnostics/progress indicators
+use Getopt::Std;
+our($opt_t,$opt_P,$opt_p,$opt_A,$opt_h,$opt_N,$opt_Z,$opt_C,$opt_L,$opt_H,$opt_V,$opt_M,$opt_T,$opt_W,$opt_b,$opt_d);
+getopts("t:P:p:ANZCLHVMT:W:bd");
+
+my $pseudo_tld = "zz";			# all locally-scoped names are under .zz which is private-use only
+my %resolver_name;
+my %resolver_addr;
+my %upstreams_set;
+my %rdata;
+my %rdata_glue;
+my @upstream_types=("A","AAAA","DNSKEY");
+my @upstream_glue_types=("A","AAAA");
+
+# Three variable sets and associative arrays for finding/securing forwarder chains
+# and eventually getting resolver information
+#
+# what to check to see if we need to do "upstream" or not
+my $server_info_selector_label="server-function";
+my $server_info_selector_type="TXT";
+my $sisl=$server_info_selector_label;
+my $sist=$server_info_selector_type;
+
+# how to find upstreams
+my $server_info_upstream_label="upstream";
+my $server_info_upstream_type="PTR";
+my $siul=$server_info_upstream_label;
+my $siut=$server_info_upstream_type;
+
+# how to find protocols
+my $server_info_protocols_label="protocols";
+my $server_info_protocols_type="TXT";
+my $sipl=$server_info_protocols_label;
+my $sipt=$server_info_protocols_type;
+
+# types always present
+my %server_info_label_type;
+$server_info_label_type{""}{"A"}=1;
+$server_info_label_type{""}{"AAAA"}=1;
+$server_info_label_type{""}{"DNSKEY"}=1;
+$server_info_label_type{"_853._tcp"}{"TLSA"}=1;
+$server_info_label_type{"_443._tcp"}{"TLSA"}=1;
+$server_info_label_type{"protocols"}{"TXT"}=1;
+
+my @protocols_list = (
+"DoT",
+"DoH",
+"TCP/53",
+"UDP/53",
+);
+
+my $base_path=$opt_p;
+if(defined($opt_d)){ printf "Running $0 for $opt_p now...\n";}
+my $knot_dir="kres";
+my $knot_config_dir="${base_path}/etc/${knot_dir}";
+my $knot_config_old="${base_path}/etc/${knot_dir}/config";
+my $knot_config_new="${base_path}/etc/${knot_dir}/config.new";
+my $named_config_path="${base_path}/etc";
+my $named_old_config="${named_config_path}/named.conf";
+my $named_new_config="${named_config_path}/named.conf.new";
+my $named_config_file="$base_path/etc/named.conf";
+my $named_data_path="${base_path}/var/named";
+my $trust_anchor_path="${base_path}/trust-anchors";
+
+my $hostname; # no default - get from generate_name
+my $arpa_fqdn="resolver-name.arpa";
+my $dot_port=853;
+my $doh_port=443;
+my $base64flag;
+my $left_curly="{";
+my $right_curly="}";
+# use "delv" instead of "kdig" or "dig"
+#  delv +short +nodnssec +noall +nosplit +multiline -t TYPE -q FQDN [@server]
+#    +multiline gets parentheses added
+#    +nosplit keeps it on a single line instead of linewrapping
+#    +short strips qname/ttl
+#    +noall removes comments
+#    +nodnssec removes RRSIG etc (NSEC[3])
+#    -t type forces correct interpretation
+#    -q FQDN forces correct interpretation
+#    -a bind.file (put the DNSKEY in a file in a directory under opt_p location, bracket/preface line with right gunk)
+#    +root=FQDN (for DNSSEC validation with correct root anchor)
+#    +cd -i (both to prevent DNSSEC validation while obtaining DNSKEY insecurely at bootstrap time)
+#  delv +short +nodnssec +noall +nosplit +multiline -t TYPE -q FQDN [@server]
+my $delv = "/usr/bin/delv";
+$delv = "/opt/local/bin/delv" if defined($opt_M);
+my $delv_opts = "+noall +nosplit +multiline +short +nodnssec";
+my @upstream_addr_list;
+
+handle_options_flags();
+
+if($opt_t eq "stub"){
+  # "stub" == forwarder without local auth stuff, only runs on localhost
+  # learned upstream(s), via knot-resolver config, /etc/resolv.conf (or just "dig" blindly?)
+  #  --> NB: dig might not learn about all upstreams!
+  #	 Parse knot-resolver config to get FORWARD stanzas
+  #      Need more details about other O/S variants (e.g. Mac, iOS, Android, Windows, etc.)
+  # configure trust anchors of upstreams
+  # configure (CA) certs of upstreams, need to be added to trust store
+  #
+  # follow the upstream paths to resolvers
+  # TODO:
+  #   test performance, reachability, ports etc to each resolver
+  #   select best policy-compliant resolvers in appropriate order
+  #   include all appropriate in the set of compliant resolvers
+  # MAYBE: put them in order into e.g. /etc/resolv.conf or similar config (e.g. browser DoH/DoT stuff)
+  # PROBABLY: add DoH proxy (possible without HTTPS proxy??)
+  # MAYBE: add full HTTPS proxy
+
+  system("cp $knot_config_old $knot_config_new");
+  do_client($knot_config_old); 
+  do_client_phase2($knot_config_old);
+
+  }
+elsif ($opt_t eq "forwarder"){
+  # "forwarder" == thing with auth server for its own name (a zone) and forwarding, listens on real IP address(es), not just localhost
+  # Will do full set of auth server things for its own name.
+
+  system("cp $knot_config_old $knot_config_new");
+  do_client($knot_config_old); 
+  do_server(1);
+  do_client_phase2($knot_config_old);
+  
+  # addresses, name
+  # Plus cert if no FQDN or no existing cert
+  # Plus dnskey if no FQDN or no secure delegation
+  # Plus TLSA
+  # Plus DNAME
+  # All of the above, PLUS learned upstream(s), listed and detailed like the above
+  # OPTIONAL: do the same thing "stub" does, find "resolver" leaf nodes, use criteria, order, pick best, publish
+  # (in addition to "upstream" list, this would be "resolver" list with names and priority (maybe SRV?), and other info in named-entity children)
+  # (re-use same code for deciding; probably also publish in "stub" case)
+  # all signed
+  #
+  }
+elsif ($opt_t eq "resolver"){
+
+
+  # I'm my own (grandpa) resolver
+  # No upstream, just my own information to be published
+  # addresses, name
+  # Plus cert if no FQDN or no existing cert
+  # Plus dnskey if no FQDN or no secure delegation
+  # Plus TLSA
+  # Plus DNAME
+  # all signed
+  #
+  # Need to obtain this from knot-resolver config
+  # Need to publish zone info on corresponding BIND server (may need to build entirely?)
+  # Need to update knot-resolver config to forward to BIND server (including for which names)
+  # Need to update knot-resolver to use DNSSEC trust anchors for zones on BIND server
+  # Need to add TLS-specific stuff to knot-resolver (server side)
+
+  system("cp $knot_config_old $knot_config_new");
+  do_server(0);
+
+  }
+else {
+  printf STDERR "Error: Unknown TYPE %s\n\n%s\n",$opt_t,$options;
+  exit(1);
+  }
+
+# Create routines to do various functions, and then high-level routines call them to simplify coding/development
+# Think about OO-perl style stuff?
+
+sub handle_options_flags {
+
+if(defined($opt_T)){$dot_port = $opt_T;}
+if(defined($opt_W)){$doh_port = $opt_W;}
+
+if(defined($opt_M)){
+  $base64flag = "-D";
+  }
+else {
+  $base64flag = "-d";
+  }
+
+
+if(defined($opt_V)){
+  printf STDERR "$0: Version %s\n", $version;
+  exit();
+  }
+
+if(defined($opt_H)){
+  printf STDERR "$0 %s\n%s\n", $flags, $options;
+  exit();
+  }
+
+if(!defined($opt_t)){
+  printf STDERR "Error: No TYPE specified\n\n%s %s\n",$0,$options;
+  exit(1);
+  }
+
+if(defined($opt_A)){
+  # set parameters to default if not otherwise defined
+  if(!defined($opt_N)){ $opt_N=1;}
+  if(!defined($opt_Z)){ $opt_Z=1;}
+  if(!defined($opt_C)){ $opt_C=1;}
+  }
+
+if(!defined($opt_p)){
+  printf STDERR "Error: No path specified\n\n%s %s\n",$0,$options;
+  exit(1);
+  }
+
+# NB generate_name handles existing names silently, always returns name (even if pre-existing)
+$hostname=generate_name($base_path,$pseudo_tld);
+}
+
+sub get_upstreams_from_file {
+  my $config_file=$_[0];
+  my @upstreams_addr;
+  # looking for the FORWARD stuff
+  my @upstream_addrs=get_forward_from_knot_config("${config_file}");
+  # handle situation where no FORWARD entries exist -- use default resolver (via "none" for addr)
+  # have addresses, resolve stuff there for name, data fields
+  foreach my $addr (@upstream_addrs){
+    # convert 'foo' to foo (don't want quotes)
+    $addr =~ s/'//g;
+    my $resolver_name = get_resolver_name($addr);
+    my $actual = get_server_info($addr,$resolver_name);
+    $resolver_name{$actual}=$resolver_name;
+    $resolver_addr{$resolver_name}=$actual;
+    push(@upstreams_addr,$actual);
+    # only set upstreams_set entries for actual upstream names for THIS client (stub/forwarder)
+    $upstreams_set{$hostname}{$resolver_name}=1;
+    }
+  return(@upstreams_addr);
+  }
+
+# NB: only call this if start_name is known to be a forwarder
+sub get_upstreams_by_name {
+  my $start_name=$_[0];
+  my @upstream_name_list = split(/,/,$rdata{"${siul}.${start_name}",$siut});
+  foreach my $usn (@upstream_name_list){
+    my @usn_addrs;
+    foreach my $type (@upstream_glue_types){
+      my $addr=$rdata_glue{"${usn}",$type};
+      next unless defined($addr);	# don't use garbage
+      next unless length($addr);	# don't use garbage
+      # convert 'foo' to foo (don't want quotes)
+      $addr =~ s/'//g;
+      push(@usn_addrs,$addr);
+      }
+    # pick one (A or AAAA), call get_server_info(), which has side-effect of making more refs
+    my $actual = get_server_info($usn_addrs[0],$usn);
+    $resolver_name{$actual}=$usn;
+    $resolver_addr{$usn}=$actual;
+    # only set upstreams_set entries for actual upstream names for THIS client (stub/forwarder)
+    $upstreams_set{$start_name}{$usn}=1;
+    }
+  return(@upstream_name_list);
+  }
+
+# get_resolver_name
+# parameter: an IP address (v4 or v6)
+# query for the well-known name $arpa_fqdn to get the resolver's name
+# Get $arpa_fqdn's trust anchor first
+# Then $get arpa_fqdn's info using that trust anchor
+# And finally get the trust anchor "glue" for the $resolver_name zone
+# (That "primes the pump" for trust anchor retrieval and validation)
+sub get_resolver_name {
+my $addr = $_[0];
+my $res;
+my $addr_opt_val;
+if($addr eq "none"){
+  # use default resolver from the system
+  $addr_opt_val="";
+  }
+else {
+  # use supplied resolver (by IP address)
+  $addr_opt_val="\@${addr}";
+  }
+# Don't validate with DNSSEC (+cd and -i both disable that) when initially getting the trust anchor (DNSKEY)
+printf "Getting DNSKEY for $arpa_fqdn" if defined($opt_d);
+my @key=`${delv} ${delv_opts} ${addr_opt_val} +cd -i -t DNSKEY -q ${arpa_fqdn}.`;
+my $key;
+for(my $j=0;$j<=$#key;$j++){
+  next unless $key[$j] =~ /^257/;
+  $key=$key[$j];
+  }
+chomp($key);
+my @values = split(/ /,$key);
+# BROKEN VERSION my $tadata = join(" ",@values[3..$#values]);
+my $tadata = join(" ",@values);
+
+# we always need to obtain the current trust anchor and name
+# save the non-validated one temporarily, use it to get the name
+my $temp_path = "${trust_anchor_path}/tmp";
+system("mkdir -p $temp_path");
+
+save_ta("${arpa_fqdn}.keys",$arpa_fqdn,$temp_path,$tadata);
+
+# confirm the key by validating the signature while getting it again
+printf "Getting DNSKEY for $arpa_fqdn with validation" if defined($opt_d);
+my @realkey=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${temp_path}/${arpa_fqdn}.keys +root=${arpa_fqdn} -t DNSKEY -q ${arpa_fqdn}.`;
+my $realkey;
+for(my $j=0;$j<=$#realkey;$j++){
+  next unless $realkey[$j] =~ /^257/;
+  $realkey=$realkey[$j];
+  }
+chomp($realkey);
+if($realkey ne $key){
+  printf STDERR "Warning! Checking trust anchor for %s, key %s mismatch against %s!\n",$arpa_fqdn,$realkey,$key;
+  }
+
+# FIXME Build an index of trust anchors known
+# FIXME e.g. have a reference count, create date, last use date, etc
+
+# Validate using DNSSEC for everything else (just NS record for now)
+printf "Getting NS for $arpa_fqdn with validation" if defined($opt_d);
+$res=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${temp_path}/${arpa_fqdn}.keys +root=${arpa_fqdn} -t NS -q ${arpa_fqdn}.`;
+my $name=$res;
+chomp($name);
+$name=~s/\.$//; # remove trailing dot generally, it will be appended when appropriate
+
+my $dest_path = "${trust_anchor_path}/${name}";
+system("mkdir -p $dest_path");
+
+# save the $arpa_fqdn trust anchor in the right place now
+save_ta("${arpa_fqdn}.keys",$arpa_fqdn,$dest_path,$tadata);
+
+# now get the special trust anchor of $name, in this signed zone as a KEY record
+printf "Getting DNSKEY for ${name}.${arpa_fqdn} with validation" if defined($opt_d);
+my @gluekey=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${temp_path}/${arpa_fqdn}.keys +root=${arpa_fqdn} -t KEY -q ${name}.${arpa_fqdn}.`;
+my $gluekey;
+for(my $j=0;$j<=$#gluekey;$j++){
+  next unless $gluekey[$j] =~ /^257/;
+  $gluekey=$gluekey[$j];
+  }
+chomp($gluekey);
+
+# save to %rdata_glue for $name
+$rdata_glue{$name,"DNSKEY"}=$gluekey;
+
+# save the $arpa_fqdn trust anchor in the right place now
+my @gluevalues = split(/ /,$gluekey);
+# BROKEN VERSION my $gluedata = join(" ",@gluevalues[3..$#gluevalues]);
+my $gluedata = join(" ",@gluevalues);
+chomp($gluedata); # make sure no newline at end
+save_ta("${name}.keys",$name,$dest_path,$gluedata);
+
+# routine returns server name, for use in subsequent queries etc.
+return($name);
+}
+
+# use DNSKEY/KEY from %rdata_glue if present
+#
+# get_server_info
+# parameters: an IP address (v4 or v6 or "none"), and a name
+# NB: IP address supplied will be "glue" in %rdata_glue or obtained from knot-resolver config file
+# NB: results saved in %rdata will be authoritative (vs %rdata_glue hints)
+# query for A, AAAA, and DNSKEY KSK (trust anchor) records at the name, and save them for that name at %rdata
+# return actual IP address(es) if "none" was the provided parameter
+# return authoritative results, not passed parameter (if not "none")
+# FIXME report inconsistencies between glue and authoritative data
+sub get_server_info {
+my ($addr,$server_name) = @_;
+my $res;
+my @actuals;
+my $addr_opt_val;
+# Need to use hash instead of array, since we can have duplicates (ipv4->name and ipv6->name)
+# Now look up the RRTYPEs at that name at that server
+
+# need to obtain (updated?) trust anchor(s) for bind.keys file directly, by name, with validation disabled first...
+# start by using the value from a (DNS)KEY record in %rdata_glue (if present) -- this is how we chain semi-securely
+# then: create initial trust anchor file a la 'bind.keys'
+# then: use with 'delv' to validate responses, on all subsequent queries here...
+if($addr eq "none"){
+  # use default resolver from the system
+  $addr_opt_val="";
+  }
+else {
+  # use supplied resolver (by IP address)
+  $addr_opt_val="\@${addr}";
+  }
+
+# determine forwarder vs resolver
+my @servtype=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${trust_anchor_path}/${server_name}/${server_name}.keys +root=${server_name}. -t ${sist} -q ${sisl}.${server_name}`;
+my $servtype=$servtype[0];
+chomp($servtype);
+$rdata{"${sisl}.${server_name}",$sist}=$servtype;
+
+foreach my $label (keys %server_info_label_type){
+  foreach my $type (keys %{$server_info_label_type{$label}}){
+    my @res2;
+    my $rdata;
+    my @keyset;
+    my $server_info="${label}.${server_name}";
+    $server_info =~ s/^\.//;
+    # Array to handle multiple values returned for '"protocols"/TXT' and '""/DNSKEY'
+    @res2=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${trust_anchor_path}/${server_name}/${server_name}.keys +root=${server_name}. -t ${type} -q ${server_info}`;
+    if($type eq "DNSKEY"){
+      # only want the KSK, not the ZSK. KSK has 257 as the first field.
+      for(my $j=0;$j<=$#res2;$j++){
+	next unless $res2[$j] =~ /^257/;
+	chomp($res2[$j]);
+	push(@keyset,$res2[$j]);
+	}
+      $rdata = join(",",@keyset); # CSV (list) if more than one key
+      }
+    elsif ($type eq "TXT"){
+      # multi-value type for "protocols"
+      $rdata=join(",",@res2);
+      }
+    else {
+      $rdata=$res2[0];
+      }
+    chomp($rdata);
+    next unless defined($rdata);	# don't save garbage
+    next unless length($rdata);	# don't save garbage
+    # save in %rdata_glue (plus trust-anchors for DNSKEYs)
+    $rdata{"${server_info}",$type}=$rdata;
+    if($type eq "DNSKEY"){
+      my $dest_path = "${trust_anchor_path}/${server_name}";
+      system("mkdir -p $dest_path");
+      save_ta("${server_name}.keys",$server_name,$dest_path,@keyset);
+      }
+    # FIXME check and/or fix trust-anchor
+    push(@actuals,$rdata) if ($label eq "" && ($type eq "A" || $type eq "AAAA"));
+    }
+  }
+
+# determine upstreams if servtype is "forwarder"
+if($servtype eq "\"forwarder\""){
+  my @keyset;
+  my @upstream_names=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${trust_anchor_path}/${server_name}/${server_name}.keys +root=${server_name}. -t ${siut} -q ${siul}.${server_name}`;
+  foreach my $upstream_name (@upstream_names){
+    # get child values for each of the @upstream_types
+    chomp($upstream_name);
+    $upstream_name =~ s/\.$//;
+    foreach my $type (@upstream_types){
+      # convert DNSKEY to KEY for this particular query
+      my $qtype = $type;
+      if($type eq "DNSKEY"){$qtype = "KEY";}
+      my @res2;
+      @res2=`${delv} ${delv_opts} ${addr_opt_val} +cd -a ${trust_anchor_path}/${server_name}/${server_name}.keys +root=${server_name}. -t ${qtype} -q ${upstream_name}.${server_name}`;
+      my $rdata;
+      if($type eq "DNSKEY"){
+	# only want the KSK, not the ZSK. KSK has 257 as the first field.
+	for(my $j=0;$j<=$#res2;$j++){
+	  next unless $res2[$j] =~ /^257/;
+	  chomp($res2[$j]);
+	  push(@keyset,$res2[$j]);
+	  }
+	$rdata = join(",",@keyset); # CSV (list) if more than one key
+	}
+      else {
+	$rdata=$res2[0];
+	}
+      chomp($rdata);
+      next unless defined($rdata);	# don't save garbage
+      next unless length($rdata);	# don't save garbage
+      # save in %rdata_glue (plus trust-anchors for DNSKEYs)
+      $rdata_glue{"${upstream_name}",$type}=$rdata;
+      if($type eq "DNSKEY"){
+	my $dest_path = "${trust_anchor_path}/${upstream_name}";
+	system("mkdir -p $dest_path");
+	save_ta("${upstream_name}.keys",$upstream_name,$dest_path,@keyset);
+	}
+      # FIXME check and/or fix trust-anchor
+      }
+    }
+  # Also be sure to save the list itself for use by caller
+  $rdata{"${siul}.${server_name}",$siut}=join(",",@upstream_names);
+  }
+
+# need to return @actuals, authoritative address values rather than passed value for addr
+return($actuals[0]);
+}
+
+sub do_client {
+  my $old_config_file=$_[0];
+  # get_upstreams_from_file and get_upstreams_by_name populate %upstreams_set and %resolver_name
+  @upstream_addr_list=get_upstreams_from_file($old_config_file);
+  }
+
+# Need to add the TLS_FORWARD
+# NB: it is placed after the forwarders to the specific zones to bind in the knot config, for ordering reasons
+sub do_client_phase2 {
+  my $old_config_file=$_[0];
+  # Originally this was just hard-coding TLS to the resolver-name.arpa target via each upstream.
+  # Now, we want to do the Full Monty:
+  # - walk the set of upstream directed graphs 
+  # - build the link-state structure discovered
+  # - process via Dijkstra algorithm
+  # - produce a list of names and addresses and trust anchors and TLS fingerprints
+
+  # Assume: This routine is ONLY called ONCE.
+  # Global state variables are used to ensure graph traversal terminates properly, and no duplicates occur.
+  # Node state is based on name, not address.
+  my %visited;
+  # Targets are indexed by protocol, so target_list{protocol} differs by protocol.
+  my %resolver_list;
+  my %resolver_list_addrs;
+  # Depending on available protocols, list(s) may be empty.
+  # Need to account for that in generating the forward rules.
+  # Ultimately it is mostly irrelevant if intermediate nodes don't support a particular protocol.
+  # Only the final resolver's protocol support matters.
+  #
+  # %upstreams_set{$hostname} is beginning set of names (relative to its first index, hostname)
+  my @get_upstreams_list=keys %{$upstreams_set{$hostname}};
+  # (already have done get_server_info on these names, so the necessary rdata_glue exists)
+
+  # continue following the upstreams links until we have covered all reachable upstreams
+  # (end the process when the list is empty and all nodes have been visited)
+  while($#get_upstreams_list >= 0) {
+    # for any name being examined:
+    # remove the name from the list
+    my $next_server = shift(@get_upstreams_list);
+    # check whether we have been here before
+    next if defined($visited{$next_server});
+    # mark the name as having been visited
+    $visited{$next_server}=1;
+    # check if a resolver or a forwarder
+    my $server_type = $rdata{"${sisl}.${next_server}",$sist};
+    if($server_type eq "\"resolver\""){
+      # if a resolver:
+      # - add to respective lists (per protocols supported)
+      foreach my $protocol (split(/,/,$rdata{"${sipl}.${next_server}",$sipt})){
+        chomp($protocol); # get rid of any newlines
+	$protocol =~ s/\"//g; # stupid quotes around TXT values - get rid of them
+        push(@{$resolver_list{$protocol}},$next_server);
+        push(@{$resolver_list_addrs{$protocol}},$resolver_addr{$next_server});
+        }
+      }
+    else {
+      # if a forwarder:
+      # - get_upstreams_by_name obtains upstreams by name
+      # - that calls get_server_info to obtain/confirm info including addresses, DNSKEY for validation
+      my @more_upstreams=get_upstreams_by_name($next_server);
+      # - Add new servers to the list
+      push(@get_upstreams_list,@more_upstreams);
+      }
+    }
+
+  # use the obtained info to add the TLS_FORWARD entries in the knot-resolver config
+  foreach my $protocol (@protocols_list){
+    # pick first protocol that has any resolvers, only.
+    # skip this one if no resolvers use that protocol
+    next unless $#{$resolver_list{$protocol}} >= 0;
+    add_resolvers_to_knot("${knot_config_new}",$protocol,@{$resolver_list_addrs{$protocol}});
+    last;
+    }
+  # FIXME FIXME FIXME
+  # This is where we left off... 2020/01/17
+  # END FIXME
+
+  # FIXME several routines to create and reference (conditionally) here
+  #add_local_dox_listeners();
+  #measure_upstreams();
+  #add_proxy_config();
+  }
+
+sub do_server {
+my $add_upstream = $_[0];
+
+  # Set up knot config file for modifications
+
+  # Check for keys, generate if needed
+  my @keys=glob("${named_data_path}/K${hostname}.*.key");
+  if($#keys<0){
+    generate_keys($hostname, "${named_data_path}", "ECDSAP256SHA256");
+    generate_keys("${arpa_fqdn}", "${named_data_path}", "ECDSAP256SHA256");
+    }
+  # Need to add trust anchors for each zone to knot-resolver config
+  # (This is needed because the resolver will forward the query to the BIND server, in order to answer)
+  # (The response has to DNSSEC validate, so needs the appropriate trust anchor(s))
+  add_trust_anchor($hostname,"${named_data_path}","${knot_config_dir}","${knot_config_new}");
+  add_trust_anchor("${arpa_fqdn}","${named_data_path}","${knot_config_dir}","${knot_config_new}");
+
+  # Create BIND zone file (NB: blindly, re-calling nukes previous instance)
+  if(defined($opt_Z)){
+    # create the zone file(s)
+    generate_zone($hostname,"${named_data_path}","@");
+    generate_zone($arpa_fqdn,"${named_data_path}",$hostname);
+    add_alien_key_to_zone($arpa_fqdn,"${named_data_path}",$hostname);
+    # WAS generate_resolver_zone($hostname,"${named_data_path}");
+    }
+
+  # read contents once, to allow multiple passes for parsing
+  my $named_config_file_contents=read_named_conf("$named_config_file");
+
+  # multiple passes, get one set of values per pass
+  # listen-on, listen-on-v6, forwarders, etc
+  my @named_v4_listeners=parse_named_conf("list", "options,listen-on", $named_config_file_contents);
+  my @named_v6_listeners=parse_named_conf("list", "options,listen-on-v6", $named_config_file_contents);
+
+  if($#named_v4_listeners==0 && $named_v4_listeners[0] eq ""){pop(@named_v4_listeners);}
+  if($#named_v6_listeners==0 && $named_v6_listeners[0] eq ""){pop(@named_v6_listeners);}
+  if($#named_v4_listeners < 0 && $#named_v6_listeners < 0){
+    # need at least one A or AAAA address
+    printf STDERR "Error: No listen-on or listen-on-v6 found, need at least one of either kind.";
+    exit(1);
+    }
+
+  # We have added parsing logic for "port PORTNUM" after the "listen-on" or "listen-on-v6" token
+  # Syntax for results are IP_ADDR@PORTNUM in the knot-resolver config
+
+  add_forward_for_zone("${knot_config_new}",$hostname,@named_v4_listeners) if $#named_v4_listeners>=0;
+  add_forward_for_zone("${knot_config_new}","${arpa_fqdn}",@named_v4_listeners) if $#named_v4_listeners>=0;;
+  add_forward_for_zone("${knot_config_new}",$hostname,@named_v6_listeners) if $#named_v6_listeners>=0;;
+  add_forward_for_zone("${knot_config_new}","${arpa_fqdn}",@named_v6_listeners) if $#named_v6_listeners>=0;;
+  # Requires trust-anchor configuration, or else need to replace FORWARD with STUB as the function, to disable DNSSEC validation
+  # Done with the add_trust_anchor routine
+
+  my @v4_listeners=parse_knot_config("${knot_config_old}","net.listen","v4","53");
+  my @v6_listeners=parse_knot_config("${knot_config_old}","net.listen","v6","53");
+  
+  # Add listeners for DoT and DoH
+  # FIXME - think about overlap between -C and -L, yes/no/maybe, e.g. the add_tls_certs bits?
+  if(defined($opt_L)){
+    #  We aren't yet doing DoT or DoH
+    #  check for DoT/DoH presence before adding, fail-safe
+    my @tls_listeners=parse_knot_config("${knot_config_old}","net.listen","v4","853");
+    my @doh_listeners=parse_knot_config("${knot_config_old}","net.listen","v4","443");
+    if($#tls_listeners==0 && $tls_listeners[0] eq ""){pop(@tls_listeners);}
+    if($#doh_listeners==0 && $doh_listeners[0] eq ""){pop(@doh_listeners);}
+    if(!($#tls_listeners < 0 && $#doh_listeners < 0)){
+      # should not have any TLS or DOH listeners yet, bail
+      printf STDERR "Error: Knot config already has listeners on TLS (853) and/or DoH (443)!\n";
+      exit(1);
+      }
+
+    #  We will need to add DoT and/or DoH to the knot config NOW
+    #  DNS-over-TLS (DoT)
+    #  net.listen('192.0.2.123', $dot_port, { kind = 'tls' })
+    #  DNS-over-HTTP (DoH)
+    #  net.listen('192.0.2.123', $doh_port, { kind = 'doh' })
+    add_listeners_for("${knot_config_new}",$dot_port,"tls",@v4_listeners,@v6_listeners);
+    add_listeners_for("${knot_config_new}",$doh_port,"doh",@v4_listeners,@v6_listeners) unless defined($opt_b);
+    }
+
+  # Add any addresses to the zone (at least one is required)
+  if($#v4_listeners>=0){
+    # add A to zone file
+    add_A_to_zone($hostname,"${named_data_path}",@v4_listeners);
+    }
+  if($#v6_listeners>=0){
+    # add AAAA to zone file
+    add_AAAA_to_zone($hostname,"${named_data_path}",@v6_listeners);
+    }
+
+  # FIXME need to maintain/update cert periodically for "knot-resolver"
+
+  if(defined($opt_C)){
+    # generate CRT
+    generate_self_signed_cert($hostname,$base_path) unless -f "${base_path}/${hostname}-cert.pem";
+    my $fp = fingerprint_cert($hostname,$base_path);
+    add_tlsa_to_zone($hostname,"${named_data_path}",$fp);
+
+    # Also need to add TLS details to knot config:
+    if(!defined($opt_b)){
+      add_tls_certs($hostname,"${base_path}","${knot_config_new}","tls","doh");
+      }
+    else {
+      # no doh if $opt_b
+      add_tls_certs($hostname,"${base_path}","${knot_config_new}","tls");
+      }
+    }
+
+
+  add_q_to_zone($hostname,"${named_data_path}");
+
+  if($add_upstream){
+    add_upstreams_to_zone($hostname,"${named_data_path}",keys %{$upstreams_set{$hostname}});
+    }
+
+  # first copy file, then append to copy
+  system("cp $named_old_config $named_new_config");
+  add_zone_to_named_conf($hostname);
+  add_zone_to_named_conf($arpa_fqdn);
+
+  add_forwarder_resolver_txt_to_zone($hostname,"${named_data_path}",$add_upstream);
+
+  # sign the zone
+  sign_zone($hostname,"${named_data_path}");
+  sign_zone("${arpa_fqdn}","${named_data_path}");
+
+  }
+
+# Check if a name exists, and if not, generate it and save it
+# Return the name
+sub generate_name {
+my ($path,$tld) = @_;
+if(-f "${path}/server-name"){
+  open(SN,"<${path}/server-name");
+  my $name=<SN>;
+  close(SN);
+  chomp($name);
+  return($name);
+  }
+
+# use (and save) supplied hostame (-h hostname)
+if(defined($opt_h)){
+  open(SN,">${path}/server-name");
+  printf SN "%s\n",$opt_h;
+  close(SN);
+  return($opt_h);
+  }
+
+# otherwise, generate a new name
+my $gen_name;
+for(my $i=0;$i<12;$i++){
+  $gen_name .= $name_alphabet[int(rand(32))];
+  }
+$gen_name .= ".${tld}";
+open(SN,">${path}/server-name");
+printf SN "%s\n",$gen_name;
+close(SN);
+return($gen_name);
+}
+
+# Need sets of routines to do the following things:
+# Read contents from base named.conf to get needed content (addresses and forwarders)
+# Create base of zone "$zone" with appropriate elements.
+# Write zone definitions into named.conf (or include file pointer in named.conf) for setting up zone(s)
+# Write zone contents into appropriate zone file(s) (referenced by named.conf included file)
+
+sub generate_zone {
+my ($zone,$path,$nameserver) = @_;
+# Create base of zone "$zone" with appropriate elements.
+# nameserver will be either an FQDN, or "@".
+# Append the trailing "." to the FQDN.
+$nameserver .= "." unless $nameserver eq "@";
+# Add other contents later, in another routine.
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+my $serial;
+my ($month,$day,$interval,$seconds);
+#  0    1    2     3     4    5     6     7     8
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(time);
+$year += 1900;
+$month = $mon+1;
+$day = $mday;
+# seconds of the current day
+$seconds = $sec + 60*$min + 3600*$hour;
+# 96 intervals per day (15 minutes aka 900 seconds)
+$interval = int($seconds/900);
+
+# need to get these from gmtime routine
+$serial=sprintf("%04d%02d%02d%02d",$year,$month,$day,$interval);
+open(ZF,">${path}/db.${zone}");
+printf ZF "\$TTL	900
+\$ORIGIN %s.
+@			15M IN SOA	@ root (
+					%s		; serial
+					15M		; refresh
+					15M		; retry
+					15M		; expiry
+					15M )		; minimum
+
+			15M IN NS	%s
+",$zone,$serial,$nameserver;
+close(ZF);
+}
+
+sub generate_resolver_zone {
+my ($zone,$path) = @_;
+# Create base of zone "resolver-name.arpa" with appropriate elements.
+# Add other contents later, in another routine.
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+my $serial;
+my ($month,$day,$interval,$seconds);
+#  0    1    2     3     4    5     6     7     8
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(time);
+$year += 1900;
+$month = $mon+1;
+$day = $mday;
+# seconds of the current day
+$seconds = $sec + 60*$min + 3600*$hour;
+# 96 intervals per day (15 minutes aka 900 seconds)
+$interval = int($seconds/900);
+
+# need to get these from gmtime routine
+$serial=sprintf("%04d%02d%02d%02d",$year,$month,$day,$interval);
+open(ZF,">${path}/db.${arpa_fqdn}");
+printf ZF "\$TTL	900
+\$ORIGIN ${arpa_fqdn}.
+@			15M IN SOA	@ root (
+					%s		; serial
+					15M		; refresh
+					15M		; retry
+					15M		; expiry
+					15M )		; minimum
+
+			15M IN NS	%s.
+",$serial,$zone;
+close(ZF);
+}
+
+# FIXME update to use file with info on keytag keydata reference-use-count initial-date v4,v6 values and filename for use by delv
+# FIXME also return name of file to use
+# FIXME possibly test ta/addr passed as arg vs any preexisting prefered ta/addr for validity and preference
+# FIXME possibly don't store passed values if not used (to avoid capture)
+sub save_ta {
+my($keyfile,$keyname,$path,@keydata_list)=@_;
+foreach my $keydata (@keydata_list){
+  my @keydata=split(/ /,$keydata);
+  open(KF,">${path}/${keyfile}");
+  printf KF "managed-keys {
+  %s. initial-key %s %s %s \"%s\";
+  };
+  ", $keyname,@keydata;
+  }
+close(KF);
+}
+
+sub add_forward_for_zone {
+my ($conf_file,$fwd_zone,@fwd_to)=@_;
+# each of these will do : policy.add(policy.suffix(policy.FORWARD('ADDRESS'), {todname('DOMAIN_NAME')}))
+open(KC,">>${conf_file}");
+for my $fwd_to (@fwd_to){
+  printf KC "policy.add(policy.suffix(policy.FORWARD('%s'), {todname('%s')}))\n",$fwd_to,$fwd_zone;
+  }
+close(KC);
+}
+
+
+sub add_tls_certs {
+my ($cert_name,$conf_dir,$config_file,@types)=@_;
+open(KC,">>${config_file}");
+for my $type (@types){
+  if($type eq "tls"){
+    printf KC "net.tls('${conf_dir}/%s-cert.pem', '${conf_dir}/%s-key.pem')\n",$cert_name,$cert_name;
+    }
+  if($type eq "doh"){
+    #  Use built-in HTTP configured for DoH only use:
+    printf KC "modules.load ( 'http' )\n";
+    printf KC "http.config({
+            tls = true,
+    	   cert = '${conf_dir}/%s-cert.pem',
+    	   key  = '${conf_dir}/%s-key.pem',
+         }, 'doh')\n",$cert_name,$cert_name;
+    }
+  }
+close(KC);
+}
+
+
+sub add_listeners_for {
+my ($conf_file,$port,$kind,@listeners)=@_;
+#  DNS-over-TLS (DoT)
+#  net.listen('192.0.2.123', 853, { kind = 'tls' })
+#  DNS-over-HTTP (DoH)
+#  net.listen('192.0.2.123', ${tls_port}, { kind = 'doh' })
+open(KC,">>${conf_file}");
+for my $listener (@listeners){
+  printf KC "net.listen('%s', %d, { kind = '%s' })\n",$listener,$port,$kind;
+  }
+close(KC);
+}
+
+# Add trust anchors to knot
+sub add_trust_anchor {
+my ($key_name,$key_src_dir,$key_dest_dir,$conf_file)=@_;
+# We will COPY the file from its BIND location into the KNOT location 
+# The KNOT file is read-write per 5011 updates to the trust anchor
+# Check for existing target file(s), bail if found (no need to add anchor)
+my @targetset=glob("${key_dest_dir}/K${key_name}.*.key");
+
+my @keyset=glob("${key_src_dir}/K${key_name}.*.key");
+my $keyset=join(" ",@keyset);
+system("cp ${keyset} ${key_dest_dir}");
+# Add the config stanza for each file.name:
+# No need to duplicate the config file, just append the appropriate entries
+#   trust_anchors.add_file('file.name');
+@targetset=glob("${key_dest_dir}/K${key_name}.*.key");
+open(KC,">>${conf_file}");
+foreach my $target (@targetset){
+ printf KC "trust_anchors.add_file('%s');\n",$target;
+ }
+close(KC);
+}
+
+# parse knot config file, look for right routine and port combo, return IPv4 or IPv6 address(es) as a list
+sub get_forward_from_knot_config {
+my ($conf_file)=@_;
+my @list=();
+open(KC,"<${conf_file}");
+while(<KC>){
+  #  FORWARD (Can use v4/v6 address, or interface name)
+  #  policy.add(policy.all(policy.FORWARD({'2001:678:1::206', '193.29.206.206'})))
+  next unless /policy.add.policy.all.policy.FORWARD./;
+  my $forward=$';
+  chomp($forward);
+  $forward=~s/[(){}]*//g;
+  push(@list,split(/,/,$forward));
+  }
+close(KC);
+if($#list<0){push(@list,"none");}
+return(@list);
+}
+
+# parse knot config file, look for right routine and port combo, return IPv4 or IPv6 address(es) as a list
+sub parse_knot_config {
+my ($conf_file,$routine,$kind,$port)=@_;
+my @list=();
+open(KC,"<${conf_file}");
+while(<KC>){
+  #  DNS (UDP+TCP, RFC 1034)
+  #  (Can use v4/v6 address, or interface name)
+  #  net.listen('192.0.2.123', 53)
+  if(/^\s*${routine}\('([^']+)', *${port}/){
+    my $listening=$1;
+    if($listening =~ /^[0-9.]*$/ && $kind eq "v4"){
+      push(@list,$listening);
+      }
+    elsif($listening =~ /^[0-9a-f:]*$/ && $kind eq "v6"){
+      push(@list,$listening);
+      }
+    else {
+      # name, not address, add to the list? (Might be incorrect thing but leave for now)
+      #push(@list,$listening);
+      }
+    }
+  }
+close(KC);
+return(@list);
+}
+
+# Stuff to put in named.conf file (modified)
+sub add_zone_to_named_conf {
+my($zone)=@_;
+open(CF,">>${named_new_config}");
+printf CF "\nzone \"%s\" IN {
+        type master;
+        file \"db.%s.signed\";
+        allow-update { none; };
+};
+", $zone,$zone;
+close(CF);
+}
+
+sub sign_zone {
+my ($zone,$path) = @_;
+my ($keyfile1,$keyfile2);
+my @keys=glob("${path}/K${zone}.*.key");
+if($#keys<0){
+  printf STDERR "Can't sign zone %s without key files\n",$zone;
+  exit(1);
+  }
+($keyfile1,$keyfile2)=@keys;
+$keyfile1 =~ s/\.key//;
+$keyfile1 =~ s/.*\///;
+$keyfile2 =~ s/\.key//;
+$keyfile2 =~ s/.*\///;
+system("(cd ${path} ; dnssec-signzone -r /dev/urandom -K . -S -o ${zone} db.${zone} ${keyfile1} ${keyfile2})");
+}
+
+sub add_q_to_zone {
+my ($zone,$path) = @_;
+# Add DNAME record to existing zone file (created by generate_zone)
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+
+open(ZF,">>${path}/db.${zone}");
+printf ZF "q                       15M IN DNAME .\n";
+close(ZF);
+}
+
+sub add_forwarder_resolver_txt_to_zone {
+my ($zone,$path,$flag) = @_;
+# Add TXT records to existing zone file (created by generate_zone), specific to "resolver" type
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+open(ZF,">>${path}/db.${zone}");
+printf ZF "server-function         15M IN TXT %s\n",($flag?"forwarder":"resolver");
+printf ZF "protocols               15M IN TXT \"UDP/53\"\n";
+printf ZF "protocols               15M IN TXT \"TCP/53\"\n";
+# FIXME - check ARGV options for these!
+printf ZF "protocols               15M IN TXT \"DoT\"\n";
+printf ZF "protocols               15M IN TXT \"DoH\"\n";
+close(ZF);
+}
+
+sub add_A_to_zone {
+my ($zone,$path,@v4) = @_;
+# Add A records to existing zone file (created by generate_zone)
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+
+open(ZF,">>${path}/db.${zone}");
+foreach my $v4 (@v4){
+  printf ZF "                        15M IN A %s\n",$v4;
+  }
+close(ZF);
+}
+
+sub add_AAAA_to_zone {
+my ($zone,$path,@v6) = @_;
+# Add AAAA records to existing zone file (created by generate_zone)
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+open(ZF,">>${path}/db.${zone}");
+foreach my $v6 (@v6){
+  printf ZF "                        15M IN AAAA %s\n",$v6;
+  }
+close(ZF);
+}
+
+sub add_resolvers_to_knot {
+my($conf_file,$proto,@upstream_addr)=@_;
+my @tls_parms;
+
+foreach my $addr (@upstream_addr){
+  # looking for TLSA records for each name, at first (best?) IP known for the name
+  # NB: MUST validate via DNSSEC, so add TA first to ensure validation works
+  my $name=$resolver_name{$addr};
+  my $ta_path="${trust_anchor_path}/${name}/${name}.keys";
+  my $res=`${delv} ${delv_opts} \@${addr} +cd -a ${ta_path} +root=${name}. -t TLSA -q _853._tcp.${name}`;
+  chomp($res);
+  # result should be "3 1 1 DATA...", barf if not "3 1 1".
+  my($ee,$x,$y,$tlsa)=split(/ /,$res);
+  if($ee ne 3 || $x ne 1 || $y ne 1){
+    printf "Error! TLSA records of type '3 1 1' are the only ones supported currently, found %s %s %s %s (length %d)\n",$ee,$x,$y,$tlsa,length($tlsa);
+    exit(1);
+    }
+  # do the magic incantation to convert from hex to base64 on the TLSA data
+  my $pin=`echo ${tlsa} | xxd -r -ps -c 64 | openssl enc -base64`;
+  chomp($pin);
+  push(@tls_parms,"{'${addr}',pin_sha256='${pin}'}");
+  }
+
+# this is the bit where we CHANGE all occurrences of FORWARD to TLS_FORWARD (with options), or EXCLUDE any with no TLS
+#
+# FIXME FIXME Check $proto and do different things for DoT, DoH, TCP/53, and UDP/53
+#
+my $tmp="${conf_file}.tmp";
+system("cat ${conf_file} >${tmp}");
+#  policy\.add\(policy\.all\(policy\.FORWARD\(
+system ("grep -v 'policy.add.policy.all.policy.FORWARD' ${tmp} >${conf_file}");
+open(KC,">>${conf_file}");
+printf KC "policy.add(policy.all(policy.TLS_FORWARD({%s})))\n",join(",",@tls_parms);
+close(KC);
+}
+
+sub add_upstream_glue_to_zone {
+my ($zone,$path, $upstream) = @_;
+# Add details of this upstream to existing zone file (created by generate_zone)
+open(ZF,">>${path}/db.${zone}");
+foreach my $type(@upstream_glue_types){
+  # rdata{} content is built in do_client()
+  next unless defined($rdata{$upstream,$type}); # don't print garbage
+  # NB: owner name (first field) is FQDN, not a relative name
+  printf ZF "%s.                15M IN %s %s\n",$upstream,$type,$rdata{$upstream,$type};
+  }
+close(ZF);
+}
+
+
+sub add_upstreams_to_zone {
+my ($zone,$path, @upstreams) = @_;
+my ($upstream);
+# Add list of upstreams to existing zone file (created by generate_zone)
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+open(ZF,">>${path}/db.${zone}");
+foreach $upstream (@upstreams){
+  printf ZF "upstream                15M IN PTR %s.\n",$upstream;
+  }
+close(ZF);
+foreach $upstream (@upstreams){
+  # add details for each upstream to this zone
+  add_upstream_detail_to_zone($zone,$path,$upstream);
+  }
+}
+
+sub add_alien_key_to_zone {
+my ($zone,$path, $keyname) = @_;
+# Add details of this upstream to existing zone file (created by generate_zone)
+open(ZF,">>${path}/db.${zone}");
+my @keys = `cat ${path}/K${keyname}*.key | grep 257`;
+my @values = split(/ /,$keys[0]);
+# BROKEN VERSION my $rdata = join(" ","(",@values[3..$#values],")");
+my $rdata = join(" ","(",@values[3..$#values],")");
+# my $rdata = join(" ","(",@values,")");
+printf ZF "%s                15M IN KEY %s\n",$keyname,$rdata;
+close(ZF);
+}
+
+sub add_upstream_detail_to_zone {
+my ($zone,$path, $upstream) = @_;
+# Add details of this upstream to existing zone file (created by generate_zone)
+open(ZF,">>${path}/db.${zone}");
+foreach my $type(@upstream_types){
+  # rdata{} content is built in do_client()
+  next unless defined($rdata{$upstream,$type}); # don't print garbage
+  next unless length($rdata{$upstream,$type}); # don't print garbage
+  my $rdata=$rdata{$upstream,$type};
+  if($type eq "DNSKEY"){
+    my @rdata = split(/ /,$rdata);
+    # NB: We publish the DNSKEY from the upstream, in a KEY record here
+    $type = "KEY"; 
+    $rdata = join(" ",@rdata[0..2],"(",$rdata[3],")");
+    #$rdata =~ s/^(.* )([^ *])$/$1 ( $2 )/;
+    }
+  printf ZF "%s                15M IN %s %s\n",$upstream,$type,$rdata;
+  }
+close(ZF);
+}
+
+sub add_tlsa_to_zone {
+my ($zone,$path,$fp) = @_;
+# Add TLSA record to existing zone file (created by generate_zone)
+# Use a cert fingerprint to create a TLSA record (calling routine needs to add it to a zone)
+# put the DNS prefix stuff (_853._tcp.) and "TLSA 3 1 1" in front of the data.
+# Calling routine will need to do whatever it needs to reread the named.conf file and/or (re)load the zone file
+open(ZF,">>${path}/db.${zone}");
+printf ZF "_853._tcp IN TLSA 3 1 1 %s\n",$fp;
+close(ZF);
+}
+
+# generate DNSSEC key pairs (KSK and ZSK) for the named zone, and write in the given directory
+sub generate_keys {
+my($zone,$path,$alg)=@_;
+# $alg should be something like ECDSAP256SHA256
+system("dnssec-keygen -r /dev/urandom -K $path -n ZONE -a $alg -G $zone");
+system("dnssec-keygen -r /dev/urandom -f KSK -K $path -n ZONE -a $alg -G $zone");
+}
+
+sub generate_self_signed_cert {
+my($zone,$path)=@_;
+# Create password-protected key first, then remove password so system can access it directly for serving TLS
+system("openssl req -x509 -newkey rsa:2048 -passout pass:password -keyout ${path}/${zone}-keypw.pem -out ${path}/${zone}-cert.pem -subj /C=us/ST=ca/O=godaddy/OU=dns/CN=${zone}");
+system("openssl pkey -passin pass:password -in ${path}/${zone}-keypw.pem -out ${path}/${zone}-key.pem");
+}
+
+sub fingerprint_cert {
+my($zone,$path)=@_;
+my($fp);
+# Use a generated cert to create a fingerprint (for use by add_tlsa_to_zone)
+# base the code on this:
+# openssl x509 -in k5bp8mgoulg4.zz-cert.pem -pubkey -noout | grep -v '^-' | base64 ${base64flag} | openssl sha256
+my @output = `openssl x509 -in ${path}/${zone}-cert.pem -pubkey -noout | grep -v '^-' | base64 ${base64flag} | openssl sha256`;
+$fp=$output[0];
+$fp =~ s/\(stdin\)= //;
+chomp($fp);
+return($fp);
+}
+
+# take body of a config file
+# extract one or more items under a specific name at a specific depth
+# return type-appropriate value(s)
+sub parse_named_conf {
+my ($parmtype, $parmref, $body)=@_;
+my @labels=split(/,/,$parmref);
+my $non_standard_port="";
+my $curdepth=0;
+my @curlabels=();
+my $curloc=0; # current index into $body
+# keep doing depth traversal until depth and context matches @labels
+# look at parmtype, get value(s) from current depth, return it/them
+# (maybe determine parmtype implicitly based on {}, "", value, or empty?)
+
+# Three forms of syntax generally are:
+# thing;
+# thing stuff [stuff ...];
+# thing { stuff; [stuff; ...] };
+
+# define some fixed strings to make editor brace matching easier
+
+# grab next "thing", update current-depth label
+# check if number of labels is correct and if all labels match
+# if not, just continue parsing
+# if match, grab next set of stuff, and return it (empty, value, or set of values)
+# if next token is right curly brace followed by ";" decrease depth
+# if next token is left curly brace increase depth
+# (we should never get a "right curly brace" without ";" after it)
+
+while($curloc<length($body)){
+  # Skip whitespace before next token...
+  while(substr($body,$curloc,1) =~ /\s/ms){$curloc++;}
+  
+  # Get a token, either a right curly brace or a parameter name
+  my $token = my_get_token($curloc,$body);
+
+  # right curly brace - end of this (sub)section
+  if($token eq "${right_curly};"){
+    pop(@curlabels);
+    $curloc += length($token);
+    $curdepth--;
+    next; # look for next label at lower scope
+    }
+  # Next token should be a bare word (unquoted), part of config file grammar
+  elsif($token !~ /^[-A-Za-z0-9]+$/){
+    printf STDERR "Bad token found at %d of %s: '%s'\n",$curloc,$body,$token if $curdepth<2;
+    # "If we get lost, go back to the begining" - Inigo Montoya
+    $curloc += length($token);
+    next; 
+    }
+  else {
+    # Maybe add debug flag, and print this if in debug mode?
+    # warn "Normal token...\n";
+    }
+  $curlabels[$curdepth]=$token;
+  # next should be (whitespace followed by ) another token or tokens, a left curly brace, or a semicolon;
+  $curloc += length($token);
+  while(substr($body,$curloc,1) =~ /\s/ms){$curloc++;}
+  $token = my_get_token($curloc,$body);
+  # Next token should be a value, or a ; (null label meaning flag),  or a left curly brace (start next level of indents)
+  # check for match against full set of @labels vs @curlabels (and grab data and return singleton or list)
+  # Now: also check for "port PORTNUM {" if latest label is "listen-on" or "listen-on-v6"
+  if(join(":",@curlabels) eq join(":",@labels)){
+    $curloc += length($token);
+    # Do "listen-on port PORT" special check/handling here
+    if($curlabels[$curdepth] =~ /^listen-on/){
+      if($token eq "port"){
+        # get next two tokens. First is port number, second is left curly, otherwise it's an error 
+	while(substr($body,$curloc,1) =~ /\s/ms){$curloc++;}
+	$token = my_get_token($curloc,$body);
+	$non_standard_port = $token;
+	$curloc += length($token);
+	while(substr($body,$curloc,1) =~ /\s/ms){$curloc++;}
+	$token = my_get_token($curloc,$body);
+	$curloc += length($token); # should be left_curly, okay to just fall through
+	}
+      }
+    if($token eq ";"){
+      # it is a flag (no values)
+      return("true");
+      }
+    elsif ($token eq "${left_curly}"){
+      # it is a list of values
+      my @ret_list=();
+      while( (my $next_token = my_get_token($curloc,$body)) ne "${right_curly};"){
+	$curloc += length($next_token);
+        $next_token =~ s/^ *//;
+        $next_token =~ s/;$//;
+	# result of using a non-standard port will be IP_ADDR@PORT instead of IP_ADDR in the FORWARD statement(s)
+	if(length($non_standard_port)){$next_token .= "@"."${non_standard_port}";}
+        push(@ret_list, $next_token);
+	while(substr($body,$curloc,1) =~ /\s/ms){$curloc++;}
+	}
+      # non-standard port number applies only to the items in the curly-brace set immediately following it
+      $non_standard_port=""; 
+      # Handle a list of only "none;", becomes the empty list
+      if($#ret_list == 0 && $ret_list[0] eq "none"){return("");}
+      # ; is the separator of choice...
+      return(join(";",@ret_list));
+      }
+    else {
+      # values - either quoted string or unquoted blob
+      return($token);
+      }
+    }
+  if($token eq "${left_curly}"){
+    $curdepth++;
+    }
+  $curloc += length($token);
+  }
+}
+
+# home-grown gettok routine
+# pass string and current index
+# returns next token, caller needs to update index after skipping whitespace(s)
+sub my_get_token {
+my ($index,$string)=@_;
+if(((substr($string,$index,1)) eq "{") ||
+  ((substr($string,$index,1)) eq ";")){
+    return(substr($string,$index,1));
+  }
+if((substr($string,$index,2)) eq "};"){
+    return(substr($string,$index,2));
+  }
+if((substr($string,$index,1)) eq '"'){
+  my $endpos=index($string,'"',$index+1);
+  # Will be followed by a semi-colon so include that
+  return(substr($string,$index,$endpos-$index+2));
+  }
+my $len;
+for($len=1;$len<=(length($string)-$index);$len++){
+  # Stop if non-quoted word is followed by whitespace or [{};]
+  if(substr($string,$index+$len+1,1) =~ /\s/ms){
+      return(substr($string,$index,$len+1));
+    }
+  if(substr($string,$index+$len+1,1) =~ /[{};]/ms){
+      if(substr($string,$index+$len+1,1) eq ";"){$len++;}
+      return(substr($string,$index,$len+1));
+    }
+  }
+printf STDERR "Warning! my_get_token hit end-of-string without returning normally! (%s)\n",substr($string,$index);
+return(substr($string,$index,$len+1));
+}
+
+sub read_named_conf {
+my $conf_file = $_[0];
+my $body = "";
+open(CF,"<$conf_file");
+while(<CF>){
+
+# keep originally-blank lines
+if(/^$/){
+  $body .= $_;
+  next;
+  }
+
+# remove single-line comment trailing stuff
+s/^[ \t]*\/\/.*//;
+s/^[ \t]*#.*//;
+
+# skip now-blank lines
+next unless /^./;
+
+$body .= $_;
+}
+close(CF);
+
+while($body =~ /\/\*/ms){
+  # find first */ after the /* and nuke everything between them inclusive
+  my $loc = length($`);
+  my $rest = $';
+  if ($rest =~ /\*\//ms){
+    my $loc2 = length($`);
+    substr($body,$loc,$loc2+4)="";
+    }
+  else {
+    printf STDERR "No joy, config file: %s! C style comment parse failed starting at current location %d (\"%s...\")\n",$conf_file,$loc,substr($body,$loc,5);
+    }
+  }
+
+$body =~ s/\n[ \t]+\n/\n/gms;
+return($body);
+}
+
+sub add_ta {
+# Incorporate a discovered Trust Anchor into the local set of TA (managed_keys in BIND-speak)
+}
+
+sub add_cert_to_trust {
+# Add the signing cert (or self-signed cert) to the browser or system trust store
+# This is needed for either DoT/DoH, or for proxying all HTTPS (including DoH diversion)
+}
+
+sub add_dhcp_option_value {
+# Add custom DHCP option/value pair(s)
+# Facilitates client learning about e.g. DNSSEC trust anchors
+}
+
+sub generate_crt {
+# CRT == certificate request
+# Supply relevant fields, create the X.509 CRT, which then needs to be (self-)signed
+}
+
+sub sign_cert {
+# Take generated CRT, sign it, save the results (for later fingerprinting, and for use by TLS for DoT/DoH)
+}

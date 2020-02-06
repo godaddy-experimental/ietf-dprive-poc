@@ -1,0 +1,71 @@
+# Server addresses (regardless of scenario)
+# FIXME - do IPv6 as well? Not yet...
+server01-address: 127.0.0.2
+server02-address: 127.0.0.3
+server03-address: 127.0.0.4
+server04-address: 127.0.0.5
+server05-address: 127.0.0.6
+server06-address: 127.0.0.7
+server07-address: 127.0.0.8
+# simple client forwarder and resolver, not upgraded
+scenario: 01; servers: 2; client-list: 1; forwarder-list: none; resolver-list: 2; relationships: 1-2; steps: start 2, start 1, test all
+
+# simple client forwarder and resolver, both upgraded
+scenario: 02; servers: 2; client-list: 1; forwarder-list: none; resolver-list: 2; relationships: 1-2; steps: upgrade 2, start 2, upgrade 1, start 1, test all
+
+# simple client forwarder, intermediate forwarder, and resolver, intermediate not upgraded
+scenario: 03; servers: 3; client-list: 1; forwarder-list: 2; resolver-list: 3; relationships: 1-2,2-3; steps: start 2, upgrade 3, start 3, upgrade 1, start 1, test all
+
+# simple client forwarder, intermediate forwarder, and resolver, intermediate upgraded
+scenario: 04; servers: 3; client-list: 1; forwarder-list: 2; resolver-list: 3; relationships: 1-2,2-3; steps: upgrade 3, start 3, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# two intermediate forwarders, neither upgraded
+scenario: 05; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,2-3,3-4; steps: upgrade 4, start 4, start 3, start 2, upgrade 1, start 1, test all
+
+# two intermediate forwarders, first one upgraded
+scenario: 06; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,2-3,3-4; steps: upgrade 4, start 4, start 3, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# two intermediate forwarders, second one upgraded
+scenario: 07; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,2-3,3-4; steps: upgrade 4, start 4, upgrade 3, start 3, start 2, upgrade 1, start 1, test all
+
+# two intermediate forwarders, both upgraded
+scenario: 08; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,2-3,3-4; steps: upgrade 4, start 4, upgrade 3, start 3, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# three intermediate forwarders, middle upgraded
+scenario: 09; servers: 5; client-list: 1; forwarder-list: 2,3,4; resolver-list: 5; relationships: 1-2,2-3,3-4,4-5; steps: upgrade 5, start 5, upgrade 1, start 1, test all
+
+# three intermediate forwarders, first and third upgraded
+scenario: 10; servers: 5; client-list: 1; forwarder-list: 2,3,4; resolver-list: 5; relationships: 1-2,2-3,3-4,4-5; steps: upgrade 5, start 5, upgrade 1, start 1, test all
+
+# three intermediate forwarders, all three upgraded
+scenario: 11; servers: 5; client-list: 1; forwarder-list: 2,3,4; resolver-list: 5; relationships: 1-2,2-3,3-4,4-5; steps: upgrade 5, start 5, upgrade 1, start 1, test all
+
+# simple client with two resolvers, both upgraded
+scenario: 12; servers: 3; client-list: 1; forwarder-list: none; resolver-list: 2,3; relationships: 1-2,1-3; steps: upgrade 3, start 3, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# simple client with two forwarders using the same resolver, neither forwarder upgraded
+scenario: 13; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,1-3,2-4,3-4; steps: upgrade 4, start 4, upgrade 1, start 1, test all
+
+# simple client with two forwarders using the same resolver, one forwarder upgraded
+scenario: 14; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,1-3,2-4,3-4; steps: upgrade 4, start 4, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# simple client with two forwarders using the same resolver, both forwarders upgraded
+scenario: 15; servers: 4; client-list: 1; forwarder-list: 2,3; resolver-list: 4; relationships: 1-2,1-3,2-4,3-4; steps: upgrade 4, start 4, upgrade 3, start 3, upgrade 2, start 2, upgrade 1, start 1, test all
+
+# FIXME got this far
+## # two forwarders both using a common forwarder which uses a single resolver (various combos of upgrade)
+## scenario: 21; servers: 5; client-list: 1; resolver-list: 2;
+## # two forwarders both using a common forwarder which uses a two resolvers (various combos of upgrade)
+## scenario: 31; servers: 6; client-list: 1; resolver-list: 2;
+## # two forwarders both using two different intermediate forwarders each of which uses a one resolver (various combos of upgrade)
+## scenario: 41; servers: 7; client-list: 1; resolver-list: 2;
+## # two forwarders both using two different intermediate forwarders which use one common resolver (various combos of upgrade)
+## scenario: 51; servers: 6; client-list: 1; resolver-list: 2;
+## # two forwarders both using two different intermediate forwarders each of which uses two common resolver (various combos of upgrade)
+## scenario: 61; servers: 7; client-list: 1; resolver-list: 2;
+## # two forwarders both using two common intermediate forwarders each of which uses two common resolver (2 x 2 x 2 box config) (various combos of upgrade)
+## scenario: 71; servers: 7; client-list: 1; resolver-list: 2;
+## # complex topology, asymmetric depths (various combos of upgrade)
+## scenario: 81; servers: 2; client-list: 1; resolver-list: 2;
+## # complex topology, non-acyclic (some upstream points at a downstream causing a partial loop)
+## scenario: 91; servers: 2; client-list: 1; resolver-list: 2;

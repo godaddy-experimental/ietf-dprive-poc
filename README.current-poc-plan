@@ -1,0 +1,66 @@
+README
+
+Current plan for POC
+
+(done) Use existing BIND config and zone file writing, for serving domains *.zz and resolver-name.arpa
+
+(done) Do "knot-resolver" config parser based on bind config parser stuff, to get listener info and forwarder info.
+
+All forwarders and resolvers will be knot-resolver
+upgraded versions of forwarders and resolvers, will selectively forward to the authority (bind) servers for their *.zz and resolver-name.arpa names
+(done) verify that the DNAME bits work correctly, they should but need to test explicitly.
+NB: Actual issue being solved for does exist; resolver-name.arpa.q.* short ciruits without going upstream even with the DNAME to ".".
+
+Next: get stuff for forwarders built/working (UPSTREAM things)
+(done) forwarder/resolver: authority forwarding via policy FORWARD ADDRESS@PORT (non-standard PORT) for forwarding to authority
+(done) authority: listen-on [port N] optional paramater to addresses (v4), or listen-on-v6 (port N) (for v6)
+(Next two items - no, breaks semantics of A/AAAA at MYNAME zone apex and UPSTREAM zone apex)
+(N/A) forwarder/resolver: net.listen(ADDR,port) - use specific port instead of 53. Handle choices for 443 and 843 via options rather than hardcoding them.
+(N/A) forwarder: upstream forwarding via vanilla policy FORWARD ADDRESS (no port required, but can be used for testing, so handle the @PORT option)
+(maybe) option: specify port numbers to update BIND config as well for specific scenario/instance configs
+add upstream lists and child namespaces, based on queries towards address(es) in FORWARD statements (all known fields in zones being generated).
+(need to test on real systems)
+
+use various values of 127.x.y.z for scenarios for testing.
+Exclude x=y=0,z=1.
+Start x and y numbering from 1, z values for hosts.
+Group by x, enumerate by y, in lists below.
+
+New work: create new directories "scenarioM" for sets of resolverN/forwarderN, for collective testing of the behavior of that set of configs. Each "scenarioM" is independent.
+Scenarios:
+- simple client forwarder and resolver, not upgraded
+- simple client forwarder and resolver, both upgraded
+- simple client forwarder, intermediate forwarder, and resolver, intermediate not upgraded
+- simple client forwarder, intermediate forwarder, and resolver, intermediate upgraded
+- two intermediate forwarders, neither upgraded
+- two intermediate forwarders, first one upgraded
+- two intermediate forwarders, second one upgraded
+- two intermediate forwarders, both upgraded
+- three intermediate forwarders, middle upgraded
+- three intermediate forwarders, first and third upgraded
+- three intermediate forwarders, all three upgraded
+- simple client with two resolvers, both upgraded
+- simple client with two forwarders using the same resolver, neither forwarder upgraded
+- simple client with two forwarders using the same resolver, one forwarder upgraded
+- simple client with two forwarders using the same resolver, two forwarders upgraded
+- two forwarders both using a common forwarder which uses a single resolver (various combos of upgrade)
+- two forwarders both using a common forwarder which uses a two resolvers (various combos of upgrade)
+- two forwarders both using two different intermediate forwarders each of which uses a one resolver (various combos of upgrade)
+- two forwarders both using two different intermediate forwarders which use one common resolver (various combos of upgrade)
+- two forwarders both using two different intermediate forwarders each of which uses two common resolver (various combos of upgrade)
+- two forwarders both using two common intermediate forwarders each of which uses two common resolver (2 x 2 x 2 box config) (various combos of upgrade)
+- complex topology, asymmetric depths (various combos of upgrade)
+- complex topology, non-acyclic (some upstream points at a downstream causing a partial loop)
+
+FIXME: Maybe also add "q" (or similar) under each UPSTREAM with a DNAME to the upstream's name instead? That will go upstream for resolution, and then get DNAMEd *there*, and then resolved... (could be very confusing)
+
+need to use more ports for kresd-bind
+(Not!) kresd-kresd connections
+figure that out, just for testing here
+
+Add extra stuff for TLS validation and maintenance (no DANE TLSA support currently) -> use pin_sha256 and hostname options to TLS config in kresd on forwarding (client) connections.
+Add extra stuff for DoT (and maybe DoH)
+Add stuff for gnutls to remove password from encrypted key files (figured out)
+See if it is possible to enable/disable fallback to Do53 (disabled, not enable-able?)
+
+Make sure DNSSEC validation works as desired, including adding appropriate trust anchors

@@ -1,0 +1,206 @@
+#!/usr/bin/perl
+#
+# build-scenarios
+#
+# take input file of meta-configuration data
+#
+# build config files for kresd and bind, as the basis of individual scenarios
+#
+# then run the upgrade script with appropriate parameters, start daemons in the required order
+#
+# take a scenario number as a single parameter, and optionally a "start" or "stop" (assume "start" unless otherwise instructed)
+#
+# FIXME - check for running scenario, if exists, stop the other one first before doing this one.
+#
+# FIXME also either take a path parameter or infer it from current directory
+
+use Getopt::Std;
+use strict;
+our ($opt_s,$opt_p,$opt_d);
+getopts("s:p:d");
+
+my $usage = "$0 [-d] -p PARENT_PATH -s SCENARIO_NUMBER [start|stop]";
+
+if(!defined($opt_s) || !defined($opt_p)){
+  printf STDERR "Error: no scenario specified\nUsage: %s\n",$usage;
+  exit(1);
+  }
+
+my $scenario = $opt_s;
+my $base_path = "${opt_p}/scenario${opt_s}";
+my $exec_path = "/home/bdickson1/dprive";
+
+my $upgrade = "${exec_path}/upgrade-proxy";
+my $run_kresd = "${exec_path}/poc-run-kresd";
+
+my %upgraded;
+
+my @type;
+
+my $command = "start";
+
+if($#ARGV>=0){
+  $command=$ARGV[0];
+  }
+
+my @addr;
+
+my $scenario_file = "scenarios.txt";
+
+open(SF,"<$scenario_file");
+while(<SF>){
+  # Server addresses (regardless of scenario)
+  # FIXME - do IPv6 as well? Not yet...
+  # server01-address: 127.0.0.2
+  if(/^server([0-9]+)-address: (.*)/){
+    $addr[$1]=$2;
+    next;
+    }
+  next unless /^scenario: (\d+);/;
+  my $rest = $';
+  chomp($rest);
+  next unless $scenario == $1;
+
+  # example input follows
+  ## simple client forwarder and resolver, not upgraded
+  # scenario: 01; servers: 2; client-list: 1; forwarder-list: 2; resolver-list: 3; relationships: 1-2,2-3; steps: start 3, start 2, start 1, test all
+  
+  my @rest = split(/;/,$rest);
+  # ($rest =~ /servers: (\S+); client-list: (\S+); forwarder-list: (\S+); resolver-list: (\S+); relationships: (\S+); steps: (\S+); /);
+  my ($servers,$clients,$forwarders,$resolvers,$relations,$steps) = @rest;
+  $servers =~ s/.*: //;
+  $clients =~ s/.*: //;
+  $forwarders =~ s/.*: //;
+  $resolvers =~ s/.*: //;
+  $relations =~ s/.*: //;
+  $steps =~ s/.*: //;
+  my @client_list=split(/,/,$clients);
+  my @forwarder_list=split(/,/,$forwarders);
+  my @resolver_list=split(/,/,$resolvers);
+  my @relationships=split(/,/,$relations);
+  my @steps=split(/,/,$steps);
+  my %upstreams;
+
+  foreach my $relation (@relationships){
+    my ($from,$to) = split(/-/,$relation);
+    push(@{$upstreams{$from}},$addr[$to]);
+    }
+
+  # do clients
+  # NB: add relationships to clients
+  foreach my $client (@client_list){
+    system("mkdir -p ${base_path}/server${client}/etc/kres");
+    system("mkdir -p ${base_path}/server${client}/var/run/kresd");
+    system("mkdir -p ${base_path}/server${client}/trust-anchors");
+    $type[$client]="stub";
+    build_kconf("${base_path}/server${client}/etc/kres/","stub",$addr[$client],@{$upstreams{$client}});
+    printf "Client at %s has upstream(s) (i.e. resolvers/forwarders): %s\n",$addr[$client],join(",",@{$upstreams{$client}}) if defined($opt_d);
+    }
+  # do forwarders
+  # NB: add relationships to forwarders
+  foreach my $forwarder (@forwarder_list){
+    next if $forwarder eq "none";
+    system("mkdir -p ${base_path}/server${forwarder}/etc/kres");
+    system("mkdir -p ${base_path}/server${forwarder}/var/named");
+    system("mkdir -p ${base_path}/server${forwarder}/var/run/named");
+    system("mkdir -p ${base_path}/server${forwarder}/var/run/kresd");
+    system("mkdir -p ${base_path}/server${forwarder}/trust-anchors");
+    $type[$forwarder]="forwarder";
+    build_kconf("${base_path}/server${forwarder}/etc/kres/","forwarder",$addr[$forwarder],@{$upstreams{$forwarder}});
+    build_bconf("${base_path}/server${forwarder}",$addr[$forwarder]);
+    printf "Forwarder at %s has upstream(s) (i.e. resolvers/forwarders): %s\n",$addr[$forwarder],join(",",@{$upstreams{$forwarder}}) if defined($opt_d);
+    }
+  # do resolvers
+  # NB: no relationships required on resolvers
+  foreach my $resolver (@resolver_list){
+    system("mkdir -p ${base_path}/server${resolver}/etc/kres");
+    system("mkdir -p ${base_path}/server${resolver}/var/named");
+    system("mkdir -p ${base_path}/server${resolver}/var/run/named");
+    system("mkdir -p ${base_path}/server${resolver}/var/run/kresd");
+    system("mkdir -p ${base_path}/server${resolver}/trust-anchors");
+    $type[$resolver]="resolver";
+    build_kconf("${base_path}/server${resolver}/etc/kres/","resolver",$addr[$resolver]);
+    build_bconf("${base_path}/server${resolver}",$addr[$resolver]);
+    printf "Resolver at %s\n",$addr[$resolver] if defined($opt_d);
+    }
+
+  # do steps
+  if($command eq "start"){
+    foreach my $step (@steps){
+      # FIXME start and upgrade commands
+      if($step =~ /upgrade.*(\d+)/){
+        my $upgrade_step=$1;
+        # upgrade server N
+	# upgrade-proxy -t forwarder -p `pwd`/test-dir/forwarder1 -C -Z -L [-b broken] [-d debug]
+	system("${upgrade} -t $type[$upgrade_step] -p ${base_path}/server${upgrade_step} -C -Z -L -b -d");
+	$upgraded{$upgrade_step}=1;
+        }
+      elsif ($step =~ /start.*(\d+)/){
+        my $start_step=$1;
+        # start step N - either/both of named and kresd
+	if($type[$start_step] ne "stub"){
+	  # start up named instance first
+	  if(defined($upgraded{$start_step})){
+	    system("named -u named -c ${base_path}/server${start_step}/etc/named.conf.new");
+	    }
+	  else {
+	    system("named -u named -c ${base_path}/server${start_step}/etc/named.conf");
+	    }
+	  }
+	# start up kresd instance now
+	if(defined($upgraded{$start_step})){
+	  system("${run_kresd} -p ${base_path}/server${start_step} start");
+	  }
+	else {
+	  system("${run_kresd} -o -p ${base_path}/server${start_step} start");
+	  }
+        }
+      }
+    }
+  else {
+    # stop
+    # order is irrelevant, we will stop all server instances
+    for (my $i=1;$i<=$servers;$i++){
+      # FIXME stop commands
+      if($type[$i] ne "stub"){
+	# stop named instance first if running
+	if(-f "${base_path}/server${i}/var/run/named/named.pid"){
+	  # NB: named will clean up after itself if killed
+	  system("kill `cat ${base_path}/server${i}/var/run/named/named.pid`");
+	  }
+	}
+      # stop kresd instance now
+      system("${run_kresd} -p ${base_path}/server${i} stop") if -f "${base_path}/server${i}/var/run/named/named.pid";
+      }
+    }
+  }
+
+close(SF);
+
+sub build_kconf {
+my ($path,$type,$my_ip,@upstreams)=@_;
+open(KC,">${path}/config");
+if($type ne "resolver"){
+  foreach my $upstream (@upstreams){
+    printf KC "policy.add(policy.all(policy.FORWARD('%s')))\n",$upstream;
+    }
+  }
+printf KC "net.listen('%s',53)\n",$my_ip;
+printf KC "net.ipv6=false\n";
+close(KC);
+}
+
+sub build_bconf {
+my ($path,$my_ip)=@_;
+open(BC,">${path}/etc/named.conf");
+printf BC "
+options {
+        directory \"%s/var/named\";
+        listen-on-v6 { none; };
+        listen-on port 5301 { %s; };
+        dnssec-enable yes;
+        dnssec-validation yes;
+        pid-file \"%s/var/run/named/named.pid\";
+};\n",$path,$my_ip,$path;
+close(BC);
+}
